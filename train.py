@@ -34,11 +34,11 @@ def compute_acc(net, patch_size, loader):
     return 100 * correct / total
 
 @click.command()
-@click.option("--lr", type=float, default=1e-3)
-@click.option("--batch_size", type=int, default=512)
+@click.option("--lr", type=float, default=2e-3)
+@click.option("--batch_size", type=int, default=1024)
 @click.option("--epochs", type=int, default=20)
 @click.option("--use_wandb", type=bool, default=True)
-@click.option("--log_freq", type=int, default=50)
+@click.option("--log_freq", type=int, default=25)
 @click.option("--eval_freq", type=int, default=4)
 @click.option("--run_name", type=str, default="minViT")
 def main(lr, batch_size, epochs, use_wandb, log_freq, eval_freq, run_name):
@@ -51,15 +51,16 @@ def main(lr, batch_size, epochs, use_wandb, log_freq, eval_freq, run_name):
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
 
     # load data
+    num_workers = 4
     trainset = torchvision.datasets.CIFAR10(root='./data', train=True,
                                             download=True, transform=transform)
     trainloader = torch.utils.data.DataLoader(trainset, batch_size=batch_size,
-                                            shuffle=True, num_workers=2)
+                                            shuffle=True, num_workers=num_workers, pin_memory=True)
 
     testset = torchvision.datasets.CIFAR10(root='./data', train=False,
                                         download=True, transform=transform)
     testloader = torch.utils.data.DataLoader(testset, batch_size=batch_size,
-                                            shuffle=False, num_workers=2)
+                                            shuffle=False, num_workers=num_workers, pin_memory=True)
 
     config = ViTConfig()
     net = ViT(config).to(device)
