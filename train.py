@@ -1,9 +1,12 @@
 import click
 import torch
+from torch.cuda.amp import GradScaler, autocast
 import torchvision
 import torchvision.transforms as transforms
 import wandb
 from model import ViT, ViTConfig
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def tokenize(images_BCHW, patch_size=16):
     B, C, _, _ = images_BCHW.shape
@@ -21,7 +24,8 @@ def compute_acc(net, patch_size, loader):
     total, correct = 0, 0
     with torch.no_grad():
         for x_BCHW, y_B in loader:
-            x_BNI = tokenize(x_BCHW, patch_size)
+            x_BNI = tokenize(x_BCHW, patch_size).to(device)
+            y_B = y_B.to(device)
             logits_BL, _ = net(x_BNI, y_B)
             _, predicted = torch.max(logits_BL, 1)
             total += y_B.numel()
@@ -30,14 +34,16 @@ def compute_acc(net, patch_size, loader):
     return 100 * correct / total
 
 @click.command()
-@click.option("--lr", type=float, default=3e-4)
-@click.option("--batch_size", type=int, default=128)
+@click.option("--lr", type=float, default=1e-3)
+@click.option("--batch_size", type=int, default=512)
 @click.option("--epochs", type=int, default=20)
 @click.option("--use_wandb", type=bool, default=True)
-@click.option("--log_freq", type=int, default=200)
-def main(lr, batch_size, epochs, use_wandb, log_freq):
+@click.option("--log_freq", type=int, default=50)
+@click.option("--eval_freq", type=int, default=4)
+@click.option("--run_name", type=str, default="minViT")
+def main(lr, batch_size, epochs, use_wandb, log_freq, eval_freq, run_name):
     if use_wandb:
-        wandb.init(project="minViT")
+        wandb.init(project="minViT", name=run_name)
 
     # image pre-processing
     transform = transforms.Compose(
@@ -46,34 +52,42 @@ def main(lr, batch_size, epochs, use_wandb, log_freq):
 
     # load data
     trainset = torchvision.datasets.CIFAR10(root='./data', train=True,
-                                            download=False, transform=transform)
+                                            download=True, transform=transform)
     trainloader = torch.utils.data.DataLoader(trainset, batch_size=batch_size,
                                             shuffle=True, num_workers=2)
 
     testset = torchvision.datasets.CIFAR10(root='./data', train=False,
-                                        download=False, transform=transform)
+                                        download=True, transform=transform)
     testloader = torch.utils.data.DataLoader(testset, batch_size=batch_size,
                                             shuffle=False, num_workers=2)
 
     config = ViTConfig()
-    net = ViT(config)
+    net = ViT(config).to(device)
+    scaler = GradScaler()
+    dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+    dtype = torch.float32
     optimizer = torch.optim.AdamW(
         net.parameters(),
         lr=lr,
         betas=(0.9, 0.999),
         weight_decay=0.01)
     print(net)
+    print("CUDA:", torch.cuda.is_available())
+    print("bfloat16:", dtype == torch.bfloat16)
 
     for epoch in range(epochs):  # loop over the dataset multiple times
 
         running_loss = 0.0
         for i, (x_BCHW, y_B) in enumerate(trainloader, 0):
-            x_BNI = tokenize(x_BCHW, config.patch_size)
+            x_BNI = tokenize(x_BCHW, config.patch_size).to(device)
+            y_B = y_B.to(device)
 
             optimizer.zero_grad()
-            _, loss  = net(x_BNI, y_B)
-            loss.backward()
-            optimizer.step()
+            with autocast(dtype=dtype):
+                _, loss  = net(x_BNI, y_B)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             # print statistics
             running_loss += loss.item()
@@ -84,11 +98,12 @@ def main(lr, batch_size, epochs, use_wandb, log_freq):
                 running_loss = 0.0
 
         # compute train and test accs
-        train_acc = compute_acc(net, config.patch_size, trainloader)
-        test_acc = compute_acc(net, config.patch_size, testloader)
-        print(f'train acc: {train_acc:.3f}, test acc: {test_acc:.3f}')
-        if use_wandb:
-            wandb.log({"train/acc": train_acc, "test/acc": test_acc})
+        if epoch % eval_freq == 0:
+            train_acc = compute_acc(net, config.patch_size, trainloader)
+            test_acc = compute_acc(net, config.patch_size, testloader)
+            print(f'train acc: {train_acc:.3f}, test acc: {test_acc:.3f}')
+            if use_wandb:
+                wandb.log({"train/acc": train_acc, "test/acc": test_acc})
 
 
 if __name__ == "__main__":
