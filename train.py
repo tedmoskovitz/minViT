@@ -24,8 +24,8 @@ def compute_acc(net, patch_size, loader):
     total, correct = 0, 0
     with torch.no_grad():
         for x_BCHW, y_B in loader:
-            x_BNI = tokenize(x_BCHW, patch_size).to(device)
-            y_B = y_B.to(device)
+            x_BNI = tokenize(x_BCHW, patch_size).to(device, non_blocking=True)
+            y_B = y_B.to(device, non_blocking=True)
             logits_BL, _ = net(x_BNI, y_B)
             _, predicted = torch.max(logits_BL, 1)
             total += y_B.numel()
@@ -40,11 +40,15 @@ def compute_acc(net, patch_size, loader):
 @click.option("--use_wandb", type=bool, default=True)
 @click.option("--log_freq", type=int, default=25)
 @click.option("--eval_freq", type=int, default=4)
+@click.option("--n_head", type=int, default=12)
+@click.option("--model_dim", type=int, default=192)
+@click.option("--dropout", type=float, default=0.1)
+@click.option("--weight_decay", type=float, default=0.01)
+@click.option("--patch_size", type=int, default=16)
+@click.option("--compile", type=bool, default=True)
 @click.option("--run_name", type=str, default="minViT")
-def main(lr, batch_size, epochs, use_wandb, log_freq, eval_freq, run_name):
-    if use_wandb:
-        wandb.init(project="minViT", name=run_name)
-
+def main(lr, batch_size, epochs, use_wandb, log_freq, eval_freq, n_head, model_dim, dropout, weight_decay, patch_size, compile, run_name):
+    config = {arg: value for arg, value in locals().items() if arg != 'args'}
     # image pre-processing
     transform = transforms.Compose(
         [transforms.ToTensor(),
@@ -62,8 +66,10 @@ def main(lr, batch_size, epochs, use_wandb, log_freq, eval_freq, run_name):
     testloader = torch.utils.data.DataLoader(testset, batch_size=batch_size,
                                             shuffle=False, num_workers=num_workers, pin_memory=True)
 
-    config = ViTConfig()
-    net = ViT(config).to(device)
+    vit_config = ViTConfig(n_head=n_head, model_dim=model_dim, dropout=dropout, patch_size=patch_size)
+    net = ViT(vit_config).to(device)
+    if compile:
+        net = torch.compile(net)
     scaler = GradScaler()
     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
     dtype = torch.float32
@@ -71,7 +77,10 @@ def main(lr, batch_size, epochs, use_wandb, log_freq, eval_freq, run_name):
         net.parameters(),
         lr=lr,
         betas=(0.9, 0.999),
-        weight_decay=0.01)
+        weight_decay=weight_decay)
+    
+    if use_wandb:
+        wandb.init(project="minViT", name=run_name, config=config)
     print(net)
     print("CUDA:", torch.cuda.is_available())
     print("bfloat16:", dtype == torch.bfloat16)
@@ -80,8 +89,8 @@ def main(lr, batch_size, epochs, use_wandb, log_freq, eval_freq, run_name):
 
         running_loss = 0.0
         for i, (x_BCHW, y_B) in enumerate(trainloader, 0):
-            x_BNI = tokenize(x_BCHW, config.patch_size).to(device)
-            y_B = y_B.to(device)
+            x_BNI = tokenize(x_BCHW,  vit_config.patch_size).to(device, non_blocking=True)
+            y_B = y_B.to(device, non_blocking=True)
 
             optimizer.zero_grad()
             with autocast(dtype=dtype):
@@ -100,8 +109,8 @@ def main(lr, batch_size, epochs, use_wandb, log_freq, eval_freq, run_name):
 
         # compute train and test accs
         if epoch % eval_freq == 0:
-            train_acc = compute_acc(net, config.patch_size, trainloader)
-            test_acc = compute_acc(net, config.patch_size, testloader)
+            train_acc = compute_acc(net, vit_config.patch_size, trainloader)
+            test_acc = compute_acc(net, vit_config.patch_size, testloader)
             print(f'train acc: {train_acc:.3f}, test acc: {test_acc:.3f}')
             if use_wandb:
                 wandb.log({"train/acc": train_acc, "test/acc": test_acc})
